@@ -11,6 +11,12 @@ envVarGroups:
         generateValue: true
       - key: LINJIAN_DEFAULT_DEVICE
         value: android-phone
+  - name: zhangxinchuang-mcp-oauth
+    envVars:
+      - key: MCP_OAUTH_SECRET
+        generateValue: true
+      - key: MCP_ACCESS_PASSWORD
+        generateValue: true
 
 services:
   - type: web
@@ -36,10 +42,7 @@ services:
     startCommand: npm start
     envVars:
       - fromGroup: zhangxinchuang-public-shared
-      - key: MCP_OAUTH_SECRET
-        generateValue: true
-      - key: MCP_ACCESS_PASSWORD
-        generateValue: true
+      - fromGroup: zhangxinchuang-mcp-oauth
       - key: LINJIAN_URL
         fromService:
           type: web
