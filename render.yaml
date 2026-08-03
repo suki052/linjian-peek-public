@@ -36,6 +36,10 @@ services:
     startCommand: npm start
     envVars:
       - fromGroup: zhangxinchuang-public-shared
+      - key: MCP_OAUTH_SECRET
+        generateValue: true
+      - key: MCP_ACCESS_PASSWORD
+        generateValue: true
       - key: LINJIAN_URL
         fromService:
           type: web
