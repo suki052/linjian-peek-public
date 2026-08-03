@@ -10,6 +10,18 @@ const RAW_LINJIAN_URL = (process.env.LINJIAN_URL || "").replace(/\/$/, "");
 const LINJIAN_URL = RAW_LINJIAN_URL && !/^https?:\/\//i.test(RAW_LINJIAN_URL)
   ? `http://${RAW_LINJIAN_URL}`
   : RAW_LINJIAN_URL;
+
+function renderPublicFallbackUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "http:" || !url.hostname || url.hostname.includes(".")) return "";
+    return `https://${url.hostname}.onrender.com`;
+  } catch {
+    return "";
+  }
+}
+
+const LINJIAN_FALLBACK_URL = renderPublicFallbackUrl(LINJIAN_URL);
 const LINJIAN_TOKEN = process.env.LINJIAN_TOKEN || "";
 const DEFAULT_DEVICE = process.env.LINJIAN_DEFAULT_DEVICE || "android-phone";
 const MCP_OAUTH_SECRET = process.env.MCP_OAUTH_SECRET || "";
@@ -113,15 +125,27 @@ function requireConfig() {
 
 async function linjianFetch(path, options = {}) {
   requireConfig();
-  const res = await fetch(`${LINJIAN_URL}${path}`, {
-    ...options,
-    headers: { "X-Auth-Token": LINJIAN_TOKEN, ...(options.headers || {}) }
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Linjian server HTTP ${res.status}: ${text || res.statusText}`);
+  const targets = [LINJIAN_URL, LINJIAN_FALLBACK_URL].filter((value, index, list) => value && list.indexOf(value) === index);
+  let lastError = null;
+  for (let index = 0; index < targets.length; index += 1) {
+    const baseUrl = targets[index];
+    try {
+      const res = await fetch(`${baseUrl}${path}`, {
+        ...options,
+        headers: { "X-Auth-Token": LINJIAN_TOKEN, ...(options.headers || {}) }
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Linjian server HTTP ${res.status}: ${text || res.statusText}`);
+      }
+      return res;
+    } catch (error) {
+      lastError = error;
+      const canTryPublicFallback = index === 0 && targets.length > 1 && error instanceof TypeError;
+      if (!canTryPublicFallback) throw error;
+    }
   }
-  return res;
+  throw lastError || new Error("Linjian server unavailable");
 }
 
 async function postCommand(payload) {
@@ -240,7 +264,7 @@ function makeServer() {
     requireConfig();
     const health = await fetch(`${LINJIAN_URL}/health`).then((r) => r.json()).catch((e) => ({ ok: false, error: String(e) }));
     const latest = await latestInfo().catch(() => null);
-    return { content: [{ type: "text", text: JSON.stringify({ ok: true, linjian_url: LINJIAN_URL, health, has_latest: Boolean(latest), latest }, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ ok: true, linjian_url: LINJIAN_URL, linjian_fallback_url: LINJIAN_FALLBACK_URL || null, health, has_latest: Boolean(latest), latest }, null, 2) }] };
   });
 
   server.tool("get_phone_state", "读取手机最近状态。返回 current_package、screen_text、accessibility_ready。", { device_id: z.string().default(DEFAULT_DEVICE) }, async ({ device_id = DEFAULT_DEVICE }) => {
@@ -614,7 +638,7 @@ const app = express();
 app.use(express.json({ limit: "32mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 MCP is running with OAuth protection. Use /mcp."));
-app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.3-url-fix", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN), oauth_ready: MCP_OAUTH_SECRET.length >= 32 && MCP_ACCESS_PASSWORD.length >= 16 }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.4-render-fallback", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN), oauth_ready: MCP_OAUTH_SECRET.length >= 32 && MCP_ACCESS_PASSWORD.length >= 16 }));
 
 function protectedResource(req, res) {
   const base = publicBaseUrl(req);
