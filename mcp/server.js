@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -8,6 +9,99 @@ const PORT = Number(process.env.PORT || 8787);
 const LINJIAN_URL = (process.env.LINJIAN_URL || "").replace(/\/$/, "");
 const LINJIAN_TOKEN = process.env.LINJIAN_TOKEN || "";
 const DEFAULT_DEVICE = process.env.LINJIAN_DEFAULT_DEVICE || "android-phone";
+const MCP_OAUTH_SECRET = process.env.MCP_OAUTH_SECRET || "";
+const MCP_ACCESS_PASSWORD = process.env.MCP_ACCESS_PASSWORD || "";
+const MCP_PUBLIC_URL = (process.env.MCP_PUBLIC_URL || "").replace(/\/$/, "");
+const MCP_SCOPES = ["phone:read", "phone:control"];
+const loginAttempts = new Map();
+const usedAuthorizationCodes = new Map();
+
+function requireOAuthConfig() {
+  if (MCP_OAUTH_SECRET.length < 32) throw new Error("Missing or weak env MCP_OAUTH_SECRET");
+  if (MCP_ACCESS_PASSWORD.length < 16) throw new Error("Missing or weak env MCP_ACCESS_PASSWORD");
+}
+
+function publicBaseUrl(req) {
+  if (MCP_PUBLIC_URL) return MCP_PUBLIC_URL;
+  const proto = String(req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
+  const host = String(req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].trim();
+  if (!/^https?$/.test(proto) || !/^[a-z0-9.-]+(?::\d+)?$/i.test(host)) throw new Error("Unable to determine public MCP URL");
+  return `${proto}://${host}`;
+}
+
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function signedValue(kind, payload, ttlSeconds) {
+  requireOAuthConfig();
+  const body = Buffer.from(JSON.stringify({ kind, ...payload, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + ttlSeconds })).toString("base64url");
+  const signature = crypto.createHmac("sha256", MCP_OAUTH_SECRET).update(body).digest("base64url");
+  return `${body}.${signature}`;
+}
+
+function verifySignedValue(value, expectedKind) {
+  requireOAuthConfig();
+  const [body, signature, extra] = String(value || "").split(".");
+  if (!body || !signature || extra) throw new Error("invalid_token");
+  const expected = crypto.createHmac("sha256", MCP_OAUTH_SECRET).update(body).digest("base64url");
+  if (!safeEqual(signature, expected)) throw new Error("invalid_token");
+  const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  if (payload.kind !== expectedKind || !Number.isFinite(payload.exp) || payload.exp < Math.floor(Date.now() / 1000)) throw new Error("expired_token");
+  return payload;
+}
+
+function normalizedScopes(scope) {
+  const requested = String(scope || "").split(/\s+/).filter((item) => MCP_SCOPES.includes(item));
+  return [...new Set(requested.length ? requested : MCP_SCOPES)];
+}
+
+function clientIp(req) {
+  return String(req.get("x-forwarded-for") || req.ip || "unknown").split(",")[0].trim();
+}
+
+function loginAllowed(req) {
+  const now = Date.now();
+  const ip = clientIp(req);
+  const recent = (loginAttempts.get(ip) || []).filter((time) => now - time < 15 * 60 * 1000);
+  loginAttempts.set(ip, recent);
+  return recent.length < 5;
+}
+
+function recordFailedLogin(req) {
+  const ip = clientIp(req);
+  loginAttempts.set(ip, [...(loginAttempts.get(ip) || []), Date.now()].slice(-10));
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>\"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char]));
+}
+
+function authorizationPage(params, error = "") {
+  const fields = Object.entries(params).map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`).join("");
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>授权掌心窗</title><style>body{margin:0;background:#fff7fa;color:#382a32;font-family:system-ui,sans-serif}.card{max-width:420px;margin:10vh auto;padding:28px;border:1px solid #f0dce5;border-radius:24px;box-shadow:0 18px 50px #c77a9c22}h1{font-size:26px;margin:0 0 8px}p{line-height:1.6;color:#765c69}.error{color:#b42318;background:#fff1f0;padding:10px 12px;border-radius:12px}input[type=password]{box-sizing:border-box;width:100%;padding:14px;border:1px solid #d9bdca;border-radius:14px;font-size:17px}button{width:100%;margin-top:14px;padding:14px;border:0;border-radius:14px;background:#d984a6;color:white;font-size:17px;font-weight:700}</style></head><body><main class="card"><h1>授权「掌心窗」</h1><p>登录后，Sol 才能通过 MCP 使用你已经允许的手机能力。口令只提交给你自己的 Render 服务。</p>${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}<form method="post" action="/oauth/authorize">${fields}<label for="password">MCP 登录口令</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">允许连接</button></form></main></body></html>`;
+}
+
+function redirectOAuthError(res, redirectUri, state, error, description) {
+  const target = new URL(redirectUri);
+  target.searchParams.set("error", error);
+  if (description) target.searchParams.set("error_description", description);
+  if (state) target.searchParams.set("state", state);
+  return res.redirect(302, target.toString());
+}
+
+function oauthClient(clientId) {
+  const client = verifySignedValue(clientId, "client");
+  if (!Array.isArray(client.redirect_uris) || client.redirect_uris.length === 0) throw new Error("invalid_client");
+  return client;
+}
+
+function verifyPkce(verifier, challenge) {
+  if (!verifier || !challenge) return false;
+  return safeEqual(crypto.createHash("sha256").update(String(verifier)).digest("base64url"), challenge);
+}
 
 function requireConfig() {
   if (!LINJIAN_URL) throw new Error("Missing env LINJIAN_URL, for example https://linjian-peek.onrender.com");
@@ -515,17 +609,115 @@ function makeServer() {
 
 const app = express();
 app.use(express.json({ limit: "32mb" }));
-app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 unified MCP is running. Use /mcp for Streamable HTTP, or /sse for SSE."));
-app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.0", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN) }));
-app.post("/mcp", async (req, res) => {
+app.use(express.urlencoded({ extended: false }));
+app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 MCP is running with OAuth protection. Use /mcp."));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.2-oauth", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN), oauth_ready: MCP_OAUTH_SECRET.length >= 32 && MCP_ACCESS_PASSWORD.length >= 16 }));
+
+function protectedResource(req, res) {
+  const base = publicBaseUrl(req);
+  return res.json({ resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: MCP_SCOPES, resource_documentation: `${base}/` });
+}
+
+app.get("/.well-known/oauth-protected-resource", protectedResource);
+app.get("/.well-known/oauth-protected-resource/mcp", protectedResource);
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const base = publicBaseUrl(req);
+  res.json({ issuer: base, authorization_endpoint: `${base}/oauth/authorize`, token_endpoint: `${base}/oauth/token`, registration_endpoint: `${base}/oauth/register`, response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none"], scopes_supported: MCP_SCOPES });
+});
+
+app.post("/oauth/register", (req, res) => {
+  try {
+    requireOAuthConfig();
+    const redirectUris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris.map(String) : [];
+    if (!redirectUris.length || redirectUris.length > 10 || redirectUris.some((uri) => { try { const url = new URL(uri); return url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1"; } catch { return true; } })) return res.status(400).json({ error: "invalid_redirect_uri" });
+    const clientId = signedValue("client", { redirect_uris: redirectUris, client_name: String(req.body?.client_name || "ChatGPT MCP client").slice(0, 120) }, 10 * 365 * 24 * 60 * 60);
+    res.status(201).json({ client_id: clientId, client_id_issued_at: Math.floor(Date.now() / 1000), redirect_uris: redirectUris, grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none" });
+  } catch (error) { res.status(503).json({ error: "server_error", error_description: String(error?.message || error) }); }
+});
+
+function validateAuthorize(req) {
+  const params = req.method === "POST" ? req.body : req.query;
+  const { response_type: responseType, client_id: clientId, redirect_uri: redirectUri, state = "", scope = "", code_challenge: codeChallenge, code_challenge_method: codeChallengeMethod, resource = "" } = params;
+  const client = oauthClient(clientId);
+  if (responseType !== "code") throw new Error("unsupported_response_type");
+  if (!client.redirect_uris.includes(String(redirectUri))) throw new Error("invalid_redirect_uri");
+  if (codeChallengeMethod !== "S256" || !codeChallenge) throw new Error("invalid_request");
+  return { response_type: responseType, client_id: String(clientId), redirect_uri: String(redirectUri), state: String(state), scope: normalizedScopes(scope).join(" "), code_challenge: String(codeChallenge), code_challenge_method: "S256", resource: String(resource || "") };
+}
+
+app.get("/oauth/authorize", (req, res) => {
+  try { const params = validateAuthorize(req); res.type("html").send(authorizationPage(params)); }
+  catch (error) { res.status(400).type("text/plain").send(`Invalid authorization request: ${String(error?.message || error)}`); }
+});
+
+app.post("/oauth/authorize", (req, res) => {
+  let params;
+  try { params = validateAuthorize(req); }
+  catch (error) { return res.status(400).type("text/plain").send(`Invalid authorization request: ${String(error?.message || error)}`); }
+  if (!loginAllowed(req)) return res.status(429).type("html").send(authorizationPage(params, "尝试次数过多，请 15 分钟后再试。"));
+  if (!safeEqual(req.body?.password || "", MCP_ACCESS_PASSWORD)) {
+    recordFailedLogin(req);
+    return res.status(401).type("html").send(authorizationPage(params, "口令不对，请检查 Render 里的 MCP_ACCESS_PASSWORD。"));
+  }
+  try {
+    const base = publicBaseUrl(req);
+    const resource = params.resource || `${base}/mcp`;
+    if (resource !== `${base}/mcp`) return redirectOAuthError(res, params.redirect_uri, params.state, "invalid_target", "Unsupported resource");
+    const code = signedValue("code", { client_id: params.client_id, redirect_uri: params.redirect_uri, code_challenge: params.code_challenge, scope: params.scope, resource, nonce: crypto.randomUUID() }, 5 * 60);
+    const target = new URL(params.redirect_uri); target.searchParams.set("code", code); if (params.state) target.searchParams.set("state", params.state); return res.redirect(302, target.toString());
+  } catch (error) { return redirectOAuthError(res, params.redirect_uri, params.state, "server_error", String(error?.message || error)); }
+});
+
+app.post("/oauth/token", (req, res) => {
+  try {
+    requireOAuthConfig();
+    const grantType = String(req.body?.grant_type || "");
+    let clientId; let scope; let resource;
+    if (grantType === "authorization_code") {
+      const rawCode = String(req.body?.code || "");
+      const code = verifySignedValue(rawCode, "code");
+      clientId = String(req.body?.client_id || ""); oauthClient(clientId);
+      if (!safeEqual(clientId, code.client_id) || !safeEqual(req.body?.redirect_uri || "", code.redirect_uri) || !verifyPkce(req.body?.code_verifier, code.code_challenge)) return res.status(400).json({ error: "invalid_grant" });
+      const codeHash = crypto.createHash("sha256").update(rawCode).digest("base64url");
+      const now = Math.floor(Date.now() / 1000);
+      for (const [hash, expires] of usedAuthorizationCodes) if (expires < now) usedAuthorizationCodes.delete(hash);
+      if (usedAuthorizationCodes.has(codeHash)) return res.status(400).json({ error: "invalid_grant" });
+      usedAuthorizationCodes.set(codeHash, Number(code.exp));
+      scope = code.scope; resource = code.resource;
+    } else if (grantType === "refresh_token") {
+      const refresh = verifySignedValue(req.body?.refresh_token, "refresh");
+      clientId = String(req.body?.client_id || refresh.client_id || ""); oauthClient(clientId);
+      if (!safeEqual(clientId, refresh.client_id)) return res.status(400).json({ error: "invalid_grant" });
+      scope = refresh.scope; resource = refresh.resource;
+    } else return res.status(400).json({ error: "unsupported_grant_type" });
+    const accessToken = signedValue("access", { sub: "bingbing", client_id: clientId, scope, aud: resource }, 60 * 60);
+    const refreshToken = signedValue("refresh", { sub: "bingbing", client_id: clientId, scope, resource }, 90 * 24 * 60 * 60);
+    res.set("Cache-Control", "no-store").json({ access_token: accessToken, token_type: "Bearer", expires_in: 3600, refresh_token: refreshToken, scope });
+  } catch (error) { res.status(400).json({ error: "invalid_grant", error_description: String(error?.message || error) }); }
+});
+
+function requireMcpAccess(req, res, next) {
+  let base;
+  try { base = publicBaseUrl(req); } catch { return res.status(503).json({ error: "server_configuration_error" }); }
+  const metadata = `${base}/.well-known/oauth-protected-resource`;
+  const header = String(req.get("authorization") || "");
+  if (!header.startsWith("Bearer ")) { res.set("WWW-Authenticate", `Bearer resource_metadata=\"${metadata}\", scope=\"${MCP_SCOPES.join(" ")}\"`); return res.status(401).json({ error: "unauthorized" }); }
+  try {
+    const token = verifySignedValue(header.slice(7), "access");
+    if (token.aud !== `${base}/mcp`) throw new Error("invalid_audience");
+    req.oauth = token; return next();
+  } catch (error) { res.set("WWW-Authenticate", `Bearer error=\"invalid_token\", resource_metadata=\"${metadata}\"`); return res.status(401).json({ error: "invalid_token" }); }
+}
+
+app.post("/mcp", requireMcpAccess, async (req, res) => {
   try { const server = makeServer(); const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }); res.on("close", () => transport.close()); await server.connect(transport); await transport.handleRequest(req, res, req.body); }
   catch (err) { console.error(err); if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err?.message || err) }, id: null }); }
 });
-app.get("/mcp", (_req, res) => res.status(405).json({ ok: false, error: "Use POST /mcp for Streamable HTTP MCP." }));
+app.get("/mcp", requireMcpAccess, (_req, res) => res.status(405).json({ ok: false, error: "Use POST /mcp for Streamable HTTP MCP." }));
 const sseTransports = new Map();
-app.get("/sse", async (_req, res) => {
+app.get("/sse", requireMcpAccess, async (_req, res) => {
   try { const transport = new SSEServerTransport("/messages", res); sseTransports.set(transport.sessionId, transport); res.on("close", () => { sseTransports.delete(transport.sessionId); transport.close(); }); await makeServer().connect(transport); }
   catch (err) { console.error(err); if (!res.headersSent) res.status(500).end(String(err?.message || err)); }
 });
-app.post("/messages", async (req, res) => { const sessionId = req.query.sessionId; const transport = sseTransports.get(sessionId); if (!transport) return res.status(404).send("No SSE transport for sessionId"); await transport.handlePostMessage(req, res, req.body); });
+app.post("/messages", requireMcpAccess, async (req, res) => { const sessionId = req.query.sessionId; const transport = sseTransports.get(sessionId); if (!transport) return res.status(404).send("No SSE transport for sessionId"); await transport.handlePostMessage(req, res, req.body); });
 app.listen(PORT, "0.0.0.0", () => { console.log(`掌心窗 unified MCP listening on 0.0.0.0:${PORT}`); console.log(`LINJIAN_URL=${LINJIAN_URL || "<missing>"}`); });

@@ -2,6 +2,17 @@
 
 掌心窗 MCP 服务会把手机端能力暴露给支持 MCP 的客户端。所有工具都需要你自己的 `LINJIAN_TOKEN`，并且手机端必须保持服务启动。
 
+## 公网 OAuth 保护
+
+从 `v0.3.5.2-oauth` 起，公网 `/mcp`、`/sse` 和 `/messages` 入口默认要求 OAuth 2.1 授权，避免知道 Render 地址的人直接调用手机能力。Blueprint 会为 MCP 服务自动生成两个独立环境变量：
+
+- `MCP_OAUTH_SECRET`：只用于签名访问令牌，不需要复制到任何客户端。
+- `MCP_ACCESS_PASSWORD`：连接 ChatGPT / Codex 时在掌心窗授权页输入。不要贴进聊天、截图或仓库。
+
+更新旧 Blueprint 后，需要在 Render 的 Blueprint 页面点一次 **Manual sync**，让新增环境变量真正写入 MCP 服务。随后打开 MCP 的 `/health`，确认 `oauth_ready` 为 `true`。
+
+ChatGPT Work 连接地址仍是 `https://你的-mcp.onrender.com/mcp`。客户端会自动发现 OAuth；首次连接时跳到掌心窗授权页，输入 Render 中的 `MCP_ACCESS_PASSWORD` 即可。要撤销所有既有连接，可在 Render 中重新生成 `MCP_OAUTH_SECRET`。
+
 ## 看见与状态
 
 - `peek_screen(wait_seconds)`：请求手机端截一张新截图，并等待上传后返回图片。
