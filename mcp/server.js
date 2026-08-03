@@ -6,7 +6,10 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
 const PORT = Number(process.env.PORT || 8787);
-const LINJIAN_URL = (process.env.LINJIAN_URL || "").replace(/\/$/, "");
+const RAW_LINJIAN_URL = (process.env.LINJIAN_URL || "").replace(/\/$/, "");
+const LINJIAN_URL = RAW_LINJIAN_URL && !/^https?:\/\//i.test(RAW_LINJIAN_URL)
+  ? `http://${RAW_LINJIAN_URL}`
+  : RAW_LINJIAN_URL;
 const LINJIAN_TOKEN = process.env.LINJIAN_TOKEN || "";
 const DEFAULT_DEVICE = process.env.LINJIAN_DEFAULT_DEVICE || "android-phone";
 const MCP_OAUTH_SECRET = process.env.MCP_OAUTH_SECRET || "";
@@ -611,7 +614,7 @@ const app = express();
 app.use(express.json({ limit: "32mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 MCP is running with OAuth protection. Use /mcp."));
-app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.2-oauth", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN), oauth_ready: MCP_OAUTH_SECRET.length >= 32 && MCP_ACCESS_PASSWORD.length >= 16 }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.3-url-fix", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN), oauth_ready: MCP_OAUTH_SECRET.length >= 32 && MCP_ACCESS_PASSWORD.length >= 16 }));
 
 function protectedResource(req, res) {
   const base = publicBaseUrl(req);
