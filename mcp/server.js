@@ -262,7 +262,7 @@ function makeServer() {
 
   server.tool("linjian_status", "检查掌心窗后端是否在线，以及 MCP 是否配置了 LINJIAN_URL 和 LINJIAN_TOKEN。", {}, async () => {
     requireConfig();
-    const health = await fetch(`${LINJIAN_URL}/health`).then((r) => r.json()).catch((e) => ({ ok: false, error: String(e) }));
+    const health = await linjianFetch("/health").then((r) => r.json()).catch((e) => ({ ok: false, error: String(e) }));
     const latest = await latestInfo().catch(() => null);
     return { content: [{ type: "text", text: JSON.stringify({ ok: true, linjian_url: LINJIAN_URL, linjian_fallback_url: LINJIAN_FALLBACK_URL || null, health, has_latest: Boolean(latest), latest }, null, 2) }] };
   });
@@ -638,7 +638,7 @@ const app = express();
 app.use(express.json({ limit: "32mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.get("/", (_req, res) => res.type("text/plain").send("掌心窗 MCP is running with OAuth protection. Use /mcp."));
-app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.4-render-fallback", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN), oauth_ready: MCP_OAUTH_SECRET.length >= 32 && MCP_ACCESS_PASSWORD.length >= 16 }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "linjian-unified-mcp", version: "0.3.5.5-status-fallback", has_url: Boolean(LINJIAN_URL), has_token: Boolean(LINJIAN_TOKEN), oauth_ready: MCP_OAUTH_SECRET.length >= 32 && MCP_ACCESS_PASSWORD.length >= 16 }));
 
 function protectedResource(req, res) {
   const base = publicBaseUrl(req);
